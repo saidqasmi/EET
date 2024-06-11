@@ -1,0 +1,13 @@
+*.so
+*.o
+a.out
+*.exe
+*.swp
+.DS_Store
+notebook/.ipynb_checkpoints
+*.Rd
+NAMESPACE
+*.egg-info*
+build
+dist
+examples/output
