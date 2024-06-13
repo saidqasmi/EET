@@ -140,23 +140,14 @@ def split_contours(segs, kinds=None):
 set_seed: np.random.seed(1)
 
 year = list(range(1850, 2101))
-filename_obs = "./data_app/HadCRUT5_year_ensemble_mean_1850-2021_g025.nc"
-filename_mod = "./data_app/K4CMIP_fullfield_tblend_CMIP6_histssp245_ann_g025_ok.nc"
-
-data_obs = xr.open_dataset(filename_obs)
-data_mod = xr.open_dataset(filename_mod)
-lat = data_obs.lat.values
-lon = data_obs.lon.values
 
 zoom = 4
-lat1 = 43.6
-lon1 = 1.43
+lat1 = 48 #43.6
+lon1 = 26 #1.43
 center = [lat1, lon1]
 
-variables = ["tx1d", "tx3d"]
-# map = Map(basemap=basemaps.NASAGIBS.ViirsTrueColorCR, center=center, zoom=zoom) # loads current satellite image
-# map = Map(basemap=basemaps.NASAGIBS.ViirsEarthAtNight2012, center=center, zoom=zoom)
-
+variables = ["Max temperature"]
+durations = ["3"]
 
 ## Path
 ##=====
@@ -167,14 +158,14 @@ assert(os.path.exists(pathInp))
 if not os.path.exists(pathOut):
 	os.makedirs(pathOut)
 
-mask_full  = xr.open_dataset("/home/qasmis/DATA/CMIP6/land_sea_mask_IPCC_antarctica.nc", mask_and_scale=False)
+mask_full  = xr.open_dataset(os.path.join( pathInp , "land_sea_mask_IPCC_antarctica.nc"), mask_and_scale=False)
 mask = mask_full.land_sea_mask.astype(int)
 lat = mask.lat
 lon = mask.lon
 
-ind_coords = np.argwhere(mask.where(mask>0,0).values)
-ind_lat = ind_coords[:,0]
-ind_lon = ind_coords[:,1]
+#ind_coords = np.argwhere(mask.where(mask>0,0).values)
+#ind_lat = ind_coords[:,0]
+#ind_lon = ind_coords[:,1]
 
 #icoord = 1460
 #idx_lat = ind_lat[icoord]
@@ -211,7 +202,8 @@ app_ui = ui.page_sidebar(
 
 	ui.sidebar(
 		"Input parameters",
-		ui.input_selectize("variable", "Variable", choices=variables, selected="tx3d"),
+		ui.input_selectize("var_nx", "Variable", choices=variables, selected="Max temperature"),
+		ui.input_selectize("duration", "Duration of the event in days", choices=durations, selected="3"),
 		ui.input_slider("year","Year",min = min(year),max = max(year),value = 2024,step = 1,sep=""),
 		ui.input_numeric("coord_lat", "Latitude:", lat1,min=-89.5,max=89.5),
 		ui.input_numeric("coord_lon", "Longitude:", lon1,min=-179.5,max=179.5),
@@ -224,27 +216,24 @@ app_ui = ui.page_sidebar(
 		ui.navset_card_tab(
 			ui.nav_panel(
 				"Event attribution",
-				ui.layout_columns(
-					ui.input_numeric("user_value", "Temperature in °C to be attributed:", f""),
-					ui.input_task_button("go_forecast", "Compute probabilities", class_="btn-success"),
-				),
+				"Under this heading, you determine whether or not an event observed (or forecast) in 2024 is attributable to climate change. Just specify its location, duration in days, and intensity in degrees Celsius.",
+				ui.input_numeric("user_value", "Temperature in °C to be attributed:", f""),
+				ui.input_task_button("go_forecast", "Compute probabilities", class_="btn-success"),
 				output_widget("plot_proba"),                        
 				output_widget("plot_far")
 			),
 			ui.nav_panel(
-				"Return period",
-				ui.layout_columns(
-					ui.input_slider("dr","Return Period (in years)",min = 2,max = 100,value = 50,step = 1,sep=""),
-					ui.input_task_button("go_dr", "Compute return level", class_="btn-success"),
-				),
+				"Return level",
+				"Under this heading, you calculate the return level in degrees Celsius associated with a return period.",
+				ui.input_slider("dr","Return Period (in years)",min = rp[0],max = rp[-1],value = 50,step = 1,sep=""),
+				ui.input_task_button("go_dr", "Compute return level", class_="btn-success"),
 				output_widget("plot_dr"),                        
 			),
 			ui.nav_panel( 
-				"Return level",
-				ui.layout_columns(
-					ui.input_numeric("rl_val", "Return level (temperature in °C):", f""),
-					ui.input_task_button("go_rl", "Compute return period", class_="btn-success"),
-				),
+				"Return period",
+				"Under this heading, you calculate the return period of an event observed in degrees Celsius.",
+				ui.input_numeric("rl_val", "Return level (temperature in °C):", f""),
+				ui.input_task_button("go_rl", "Compute return period", class_="btn-success"),
 				output_widget("plot_rl")
 			),
 		),
@@ -290,7 +279,6 @@ def server(input, output, session):
 	# via reactive side-effects
 	@render_widget
 	def map():
-		cs = plt.contourf(lat, lon, val_mod()[0,:,:].T)
 		map_tas = L.Map(basemap=L.basemaps.CartoDB.Positron, 
 						center=center, 
 						zoom=zoom, 
@@ -301,33 +289,7 @@ def server(input, output, session):
 						min_zoom=3, 
 						max_zoom=6,
 						)
-		# add contours as polygons
-		# hardwired colors for now: these correspons to the 8-level default of matplotlib with an added orange color
-		colors = [linear.YlOrRd_04(i/(len(cs.levels)-1)) for i in range(len(cs.levels))]        
-		allsegs = cs.allsegs
-		allkinds = cs.allkinds
-
-		for clev in range(len(cs.allsegs)):
-			kinds = None if allkinds is None else allkinds[clev]
-			segs = split_contours(allsegs[clev], kinds)
-			polygons = L.Polygon(
-							locations=[p.tolist() for p in segs],
-							# locations=segs[14].tolist(),
-							color=colors[min(clev, 4)],
-							weight=1,
-							opacity=0.4,
-							fill_color=colors[clev],
-							fill_opacity=0.4
-			)
-			#map_tas.add_layer(polygons)
 		
-		legend_colors = {}
-		for i in reversed(range(len(cs.levels)-1)):
-			legend_colors["{:0.1f}-{:0.1f}".format(cs.levels[i], cs.levels[i+1])] = linear.YlOrRd_04(i/(len(cs.levels)-1))
-
-		legend = L.LegendControl(legend_colors, title="°C", position="topright")
-		#map_tas.add_control(legend)
-
 		return map_tas #L.Map(zoom=6, center=center)
 
 	# Add marker for first location
@@ -888,48 +850,6 @@ def server(input, output, session):
 		#fig_dr.update_layout(title="Return period of "+str(input.year())+" years at "+str(round(cons_calc()[2],2))+"°N / "+str(round(cons_calc()[3],2))+" °E")
 
 		return fig_dr
-
-	@reactive.Calc
-	def val_mod():
-		year_sel = input.year()
-		data_mod_sub = data_mod.avg_cons_loc_glo.sel(time=str(year_sel))
-
-		return data_mod_sub
-	
-	@reactive.Calc
-	def val_mod_ts():
-		data_mod_sub_coord = data_mod.avg_cons_loc_glo.sel(lat=cons_calc()[2],lon=cons_calc()[3],method="nearest")
-
-		return data_mod_sub_coord
-
-
-	@render_widget
-	def plot_kcc():  
-
-		fig_rl = go.Figure()
-
-		fig_rl.add_trace(go.Scatter(
-			x=year,
-			y=val_mod_ts(),
-			yhoverformat='.1f',
-			mode='lines',
-			line=dict(color="red"),
-			hoveron='points',
-			name="Best-estimate"
-		))
-
-		fig_rl.add_vline(
-			x=input.year(), line_width=3, line_dash="dot",
-			annotation_text=str(input.year()), 
-			annotation_position="bottom right",
-			line_color="blue")
-
-		fig_rl.update_layout(title="Constrained temperature at "+str(round(cons_calc()[2],2))+"°N / "+str(round(cons_calc()[3],2))+" °E")
-		fig_rl.update_xaxes(title_text='year')
-		fig_rl.update_yaxes(title_text='°C')
-
-
-		return fig_rl
 
 
 app = App(app_ui, server)
