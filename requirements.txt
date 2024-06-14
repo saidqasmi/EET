@@ -7,12 +7,12 @@ numpy
 shiny
 shinywidgets
 plotly
-pickle
 itertools
-datetime
 scipy
 cmdstanpy
 pandas
-sys
-os
-
+arviz
+seaborn
+tabulate
+pygam
+pybind11
