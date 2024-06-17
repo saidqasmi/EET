@@ -483,8 +483,6 @@ def server(input, output, session):
 		if not input.coord_lat() or not input.coord_lon():
 			raise SafeException("Longitude is a numeric value between -180 and 180")
 
-		input.go_forecast()
-
 		#with reactive.isolate():
 			#year_user = input.year()
 			#var_user = input.variable()
@@ -507,7 +505,7 @@ def server(input, output, session):
 			name="Observations"
 		))
 
-		fig_ts.update_layout(title="Observed "+input.variable()+" at "+str(round(lat_sub,2))+"°N / "+str(round(lon_sub,2))+" °E")
+		fig_ts.update_layout(title="Observed "+input.var_nx()+" ("+input.duration()+"-day mean) at "+str(round(lat_sub,2))+"°N / "+str(round(lon_sub,2))+" °E")
 		fig_ts.update_xaxes(title_text='year')
 		fig_ts.update_yaxes(title_text='°C')
 
