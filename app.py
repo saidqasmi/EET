@@ -29,11 +29,6 @@ import NSSEA as ns
 import NSSEA.plot as nsp
 import NSSEA.models as nsm
 
-from cmdstanpy import cmdstan_path, set_cmdstan_path
-#This has to be done manually ?
-set_cmdstan_path('/home/ubuntu/miniconda3/envs/stan/bin/cmdstan/')
-cmdstan_path()
-
 ## Plot libraries
 ##===============
 #%matplotlib inline
