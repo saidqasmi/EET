@@ -7,7 +7,6 @@ numpy
 shiny
 shinywidgets
 plotly
-itertools
 scipy
 cmdstanpy
 pandas
@@ -16,3 +15,5 @@ seaborn
 tabulate
 pygam
 pybind11
+statsmodels
+netCDF4

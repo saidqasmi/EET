@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import ipyleaflet as L
+from ipyleaflet import AwesomeIcon, Marker, Map
 import ipywidgets as widgets
 from branca.colormap import linear
 import xarray as xr
@@ -8,6 +9,7 @@ from shiny import App, reactive, render, ui
 from shinywidgets import output_widget, render_widget  
 from shiny.types import SafeException
 from shiny.types import SilentException
+from pathlib import Path
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -28,6 +30,7 @@ import xarray as xr
 import NSSEA as ns
 import NSSEA.plot as nsp
 import NSSEA.models as nsm
+from cmdstanpy import cmdstan_path, set_cmdstan_path
 
 ## Plot libraries
 ##===============
@@ -36,6 +39,8 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.patches as mplpatch
+import matplotlib.gridspec as mplgrid
+import matplotlib.backends.backend_pdf as mpdf
 
 # SDFC a tendance a afficher plein de warnings pendant les fits : on les désactive
 import warnings
@@ -44,6 +49,14 @@ warnings.simplefilter("ignore")
 ################################################
 ## Fonctions calcul ##
 ################################################
+
+def plink( x , e = 2 / 3 ):
+	y = np.arctan( np.log(x) ) / (np.pi / 2)
+	return np.power( 1 + y , e )
+
+def PRlink( x , e = 3 ):
+	y = np.arctan( np.log(x ) ) / (np.pi / 2)
+	return np.sign(y) * np.power( np.abs(y) , e )
 
 def correct_miss( X , lo =  100 , up = 350 ):##{{{
 	#	return X
@@ -76,8 +89,12 @@ def load_obs( path, ilat, ilon ):##{{{
 	dYo = dYo_full.sel(lat=ilat,lon=ilon,method="nearest")
 	year_Yo = dYo.time["time.year"].values
 	Yo    = pd.DataFrame( dYo.tasmax.values.ravel() , index = year_Yo )
-		
-	return Xo,Yo
+    
+	lat = dYo.lat.values
+	lon = dYo.lon.values
+ 
+	return Xo,Yo,lat,lon
+
 ##}}}
 
 class NumpyLog: ##{{{
@@ -93,6 +110,26 @@ class NumpyLog: ##{{{
 	def write( self , msg ):
 		self._msg.append(msg)
 ##}}}
+
+def split_into_valid_time( nan_values , ci ):##{{{
+	time_valid    = []
+	time_notvalid = []
+	t = int(nan_values.time[0])
+	on_valid      = bool(nan_values.loc[t] < ci)
+	curr = [t]
+	
+	for t in nan_values.time[1:]:
+		curr.append(int(t))
+		is_valid = bool(nan_values.loc[t] < ci)
+		if not is_valid == on_valid:
+			if on_valid: time_valid.append(curr)
+			else: time_notvalid.append(curr)
+			on_valid = not on_valid
+			curr = [int(t)]
+	if on_valid: time_valid.append(curr)
+	else: time_notvalid.append(curr)
+	
+	return time_valid,time_notvalid
 
 
 ################################################
@@ -142,18 +179,18 @@ set_seed: np.random.seed(1)
 year = list(range(1850, 2101))
 
 zoom = 4
-lat1 = 48 #43.6
-lon1 = 26 #1.43
+lat1 = 43 #43.6
+lon1 = 19 #1.43
 center = [lat1, lon1]
 
-variables = ["Max temperature"]
+variables = ["maximum temperature"]
 durations = ["3"]
 
 ## Path
 ##=====
 basepath = os.getcwd() 
 pathInp  = os.path.join( basepath , "data/"  )
-pathOut  = os.path.join( basepath , "data/cons" )
+pathOut  = os.path.join( basepath , "data/cons/" )
 assert(os.path.exists(pathInp))
 if not os.path.exists(pathOut):
 	os.makedirs(pathOut)
@@ -199,46 +236,58 @@ nrp = len(rp)
 ## Shiny app UI
 ##=======================
 app_ui = ui.page_sidebar(
-
+	
 	ui.sidebar(
 		"Input parameters",
-		ui.input_selectize("var_nx", "Variable", choices=variables, selected="Max temperature"),
+		ui.input_selectize("var_nx", "Variable", choices=variables, selected="maximum temperature"),
 		ui.input_selectize("duration", "Duration of the event in days", choices=durations, selected="3"),
 		ui.input_slider("year","Year",min = min(year),max = max(year),value = 2024,step = 1,sep=""),
 		ui.input_numeric("coord_lat", "Latitude:", lat1,min=-89.5,max=89.5),
 		ui.input_numeric("coord_lon", "Longitude:", lon1,min=-179.5,max=179.5),
-	),  
+	), 
 	ui.layout_columns(
 		ui.card(
+            ui.p("Click on the marker and drag at the desired location. Calculations are available on continental areas only (except Antarctica)."),
 			output_widget("map"),
-			output_widget("plot_ts")
+			ui.output_plot("plot_ts")
 		),
 		ui.navset_card_tab(
 			ui.nav_panel(
-				"Event attribution",
-				"Under this heading, you determine whether or not an event observed (or forecast) in 2024 is attributable to climate change. Just specify its location, duration in days, and intensity in degrees Celsius.",
+				"Attribution of a new event",
+				"Under this heading, you determine whether or not a newly observed event is attributable to climate change. Just specify its location, duration in days, and intensity in degrees Celsius. The slider on the left can be used to determine the properties of the event year by year.",
 				ui.input_numeric("user_value", "Temperature in °C to be attributed:", f""),
-				ui.input_task_button("go_forecast", "Compute probabilities", class_="btn-success"),
-				output_widget("plot_proba"),                        
-				output_widget("plot_far")
+				ui.input_task_button("go_forecast", "Compute probabilities (takes 1 minute)", class_="btn-success"),
+				ui.output_data_frame("proba_df"),
+				ui.output_plot("plot_proba"),                   
+				ui.output_plot("plot_far"),
+				#ui.output_plot("plot_param")
 			),
-			ui.nav_panel(
-				"Return level",
-				"Under this heading, you calculate the return level in degrees Celsius associated with a return period.",
-				ui.input_slider("dr","Return Period (in years)",min = rp[0],max = rp[-1],value = 50,step = 1,sep=""),
-				ui.input_task_button("go_dr", "Compute return level", class_="btn-success"),
-				output_widget("plot_dr"),                        
-			),
-			ui.nav_panel( 
-				"Return period",
-				"Under this heading, you calculate the return period of an event observed in degrees Celsius.",
-				ui.input_numeric("rl_val", "Return level (temperature in °C):", f""),
-				ui.input_task_button("go_rl", "Compute return period", class_="btn-success"),
-				output_widget("plot_rl")
-			),
+			ui.nav_menu(
+				"Climate monitoring",
+				ui.nav_panel(
+					"Compute return level from a given return period",
+					"Under this heading, you calculate the return level in degrees Celsius associated with a return period. The slider on the left can be used to determine the properties of the event year by year.",
+					ui.input_slider("dr","Return Period (in years)",min = rp[0],max = rp[-1],value = 50,step = 1,sep=""),
+					ui.input_task_button("go_dr", "Compute return level (takes 1 minute)", class_="btn-success"),
+					ui.output_data_frame("rl_df"),
+					ui.output_plot("plot_dr")                 
+				),
+				ui.nav_panel( 
+					"Compute return period from a given return level",
+					"Under this heading, you calculate the return period of an observed event in degrees Celsius. The slider on the left can be used to determine the properties of the event year by year.",
+					ui.input_numeric("rl_val", "Return level (temperature in °C):", f""),
+					ui.input_task_button("go_rl", "Compute return period (takes 1 minute)", class_="btn-success"),
+					ui.output_data_frame("rp_df"),
+					ui.output_plot("plot_rl"),
+					#ui.output_plot("plot_param_rl")
+				),
+			)
 		),
-		col_widths=(4, 8)
+		col_widths=(6, 6)
 	),
+    ui.p("Reference: Qasmi et al. 2025, submitted: An automatic procedure for the attribution of climate extremes events at the global scale"),	
+	title="Extreme event fast attribution application",
+	
 )
 	
 
@@ -246,6 +295,8 @@ app_ui = ui.page_sidebar(
 
 
 def server(input, output, session):
+
+	set_cmdstan_path(os.path.join('/d0/www-ubuntu-extreme-event-app2025/.cmdstan/cmdstan-2.36.0/'))
 
 	# Reactive values to store location information
 	loc1 = reactive.value()
@@ -329,6 +380,8 @@ def server(input, output, session):
 	@reactive.event(input.go_forecast, ignore_none=True, ignore_init=True)
 	def cons_calc():
 
+		set_seed: np.random.seed(1)
+
 		input.go_forecast()
 
 		with reactive.isolate():
@@ -337,11 +390,7 @@ def server(input, output, session):
 			val_abs = input.user_value()
 			lat_sub = input.coord_lat()
 			lon_sub = input.coord_lon()
-
-
-		if not input.user_value():
-			raise Exception("A numeric value is required")
-
+        
 		idx_lat = list(lat.lat.values).index(lat.sel(lat=lat_sub,method="nearest").lat)
 		idx_lon = list(lon.lon.values).index(lon.sel(lon=lon_sub,method="nearest").lon)
 
@@ -350,7 +399,16 @@ def server(input, output, session):
 
 		## Load models and observations
 		##=============================
-		Xo,Yo_tmp = load_obs( pathInp , lat_sub, lon_sub )
+		Xo,Yo_tmp,lat_real,lon_real = load_obs( pathInp , lat_sub, lon_sub )
+		
+		if not val_abs:
+			raise Exception("A numeric value is required")
+		
+		val_max = np.mean(Yo_tmp.values-273.15) + 4*np.std(Yo_tmp.values)
+		val_min = np.min(Yo_tmp.values-273.15)
+		
+		if val_abs > val_max or val_abs < val_min:
+			raise Exception("A realistic value is required")
 
 		## Anomaly from observations
 		##==========================
@@ -369,7 +427,7 @@ def server(input, output, session):
 
 		## Multi-model
 		##============
-		climMM_file = os.path.join( pathInp , "climMM_lat%s_lon%s.nc" % (idx_lat,idx_lon) )
+		climMM_file = os.path.join( pathInp , "climMM/climMM_lat%s_lon%s.nc" % (idx_lat,idx_lon) )
 		climMM = ns.Climatology.from_netcdf( climMM_file, ns_law )
 
 		## Apply constraints
@@ -380,7 +438,7 @@ def server(input, output, session):
 
 		#np.bool=np.bool_
 		#climCXCB   = ns.constrain_law( climCX , Yo , verbose = verbose , **bayes_kwargs )
-		climCXCB = ns.stan_constrain(climCX,Yo,'stan_files/GEV_non_stationary.stan', **bayes_kwargs)
+		climCXCB = ns.stan_constrain(climCX,Yo,'stan_files/GEV_non_stationary.stan', install_dir="/d0/www-ubuntu-extreme-event-app2025/.cmdstan/cmdstan-2.36.0", **bayes_kwargs)
 
 		## Stats
 		upper_side = "upper"
@@ -390,7 +448,9 @@ def server(input, output, session):
 		samples = climCXCB.sample
 		nsample_MCMC = climCXCB.data.sample_MCMC.shape[0]
 		samples_MCMC = climCXCB.data.sample_MCMC
-		
+		n_x=len(climCXCB.X.sample)-1 #N tirages de X
+		n_ess=int((len(climCXCB.law_coef.sample_MCMC)-1)/n_x) # N de tirages par chaine
+
 		n_stat = 6
 
 		event_user = val_abs+273.15-bias["Multi_Synthesis"].values
@@ -398,38 +458,25 @@ def server(input, output, session):
 		## Output
 		stats = xr.DataArray( np.zeros( (ny,nsample_MCMC,n_stat) ) , coords = [climCXCB.X.time , samples_MCMC , ["pC","pF","IC","IF","PR","dI"] ] , dims = ["time","sample_MCMC","stats"] )
 
-		## 
-		law = climCXCB.ns_law
+		XF_noBE=np.tile(climCXCB.X.loc[:,:,"F","Multi_Synthesis"][:,1:], (1, n_ess)).T
+		XF_data=np.vstack((XF_noBE,climCXCB.X.loc[:,"BE","F","Multi_Synthesis"])) #Ne pas répéter le BE.
+		XF=xr.DataArray( XF_data.T, coords = [climCXCB.X.time , samples_MCMC  ] , dims = ["time","sample_MCMC"] )
 
-		for s_MCMC in samples_MCMC:
-			
-			s_X = str(s_MCMC.values).split("_")[0]
+		XC_noBE=np.tile(climCXCB.X.loc[:,:,"C","Multi_Synthesis"][:,1:], (1, n_ess)).T
+		XC_data=np.vstack((XC_noBE,climCXCB.X.loc[:,"BE","C","Multi_Synthesis"])) #Ne pas répéter le BE.
+		XC=xr.DataArray( XC_data.T, coords = [climCXCB.X.time , samples_MCMC  ] , dims = ["time","sample_MCMC"] )
 
-			## Start with params
-			law.set_params( climCXCB.law_coef.loc[:,s_MCMC,"Multi_Synthesis"].values )
+		#XF = xr.DataArray( np.tile(climCXCB.X.loc[:,"BE","F","Multi_Synthesis"], (nsample_MCMC, 1)).T, coords = [climCXCB.X.time , samples_MCMC  ] , dims = ["time","sample_MCMC"] )
+		#XC = xr.DataArray( np.tile(climCXCB.X.loc[:,"BE","C","Multi_Synthesis"], (nsample_MCMC, 1)).T, coords = [climCXCB.X.time , samples_MCMC  ] , dims = ["time","sample_MCMC"] )
+		
+		locF  = climCXCB.law_coef.loc["loc0",:,"Multi_Synthesis"] + XF * climCXCB.law_coef.loc["loc1",:,"Multi_Synthesis"]
+		locC  = climCXCB.law_coef.loc["loc0",:,"Multi_Synthesis"] + XC * climCXCB.law_coef.loc["loc1",:,"Multi_Synthesis"]
+		scaleF = np.exp(climCXCB.law_coef.loc["scale0",:,"Multi_Synthesis"] + XF * climCXCB.law_coef.loc["scale1",:,"Multi_Synthesis"])
+		scaleC = np.exp(climCXCB.law_coef.loc["scale0",:,"Multi_Synthesis"] + XC * climCXCB.law_coef.loc["scale1",:,"Multi_Synthesis"])
+		shape = climCXCB.law_coef.loc["shape0",:,"Multi_Synthesis"] + xr.zeros_like(locF)
 
-			## Go to factual world
-			law.set_covariable( climCXCB.X.loc[:,s_X,"F","Multi_Synthesis"].values , time )
-
-			## Find value of event definition
-			value = np.zeros(ny) + event_user
-			
-			## Find pF
-			stats.loc[:,s_MCMC,"pF"] = law.sf( value , time ) if upper_side else law.cdf( value , time )
-
-			## Find probability of the event in factual world
-			pF = np.zeros(ny) + stats.loc[time,s_MCMC,"pF"]
-
-			## IF
-			stats.loc[:,s_MCMC,"IF"] = law.isf( pF , time ) if upper_side else law.icdf( pF , time )
-
-			## Find pC
-			law.set_covariable( climCXCB.X.loc[:,s_X,"C","Multi_Synthesis"].values , time )
-			stats.loc[:,s_MCMC,"pC"] = law.sf( value , time ) if upper_side else law.cdf( value , time )
-
-			## IC
-			stats.loc[:,s_MCMC,"IC"] = law.isf( pF , time ) if upper_side else law.icdf( pF , time )
-
+		stats.loc[:,:,"pF"] = sc.genextreme.sf( event_user , loc = locF , scale = scaleF , c = - shape ).T
+		stats.loc[:,:,"pC"] = sc.genextreme.sf( event_user , loc = locC , scale = scaleC , c = - shape ).T
 
 		## PR
 		stats.loc[:,:,"PR"] = stats.loc[:,:,"pF"] / stats.loc[:,:,"pC"]
@@ -437,45 +484,9 @@ def server(input, output, session):
 		## deltaI
 		stats.loc[:,:,"dI"] = stats.loc[:,:,"IF"] - stats.loc[:,:,"IC"]
 
-		return stats, val_abs, lat_sub, lon_sub, Yo_tmp#, year_user
+		return stats, val_abs, lat_real, lon_real, Yo_tmp, climMM, climCXCB
 
-	@reactive.calc
-	def p0_calc():
-		df_pC = pd.DataFrame({"year": cons_calc()[0].time , "pC": cons_calc()[0].loc[:,'BE','pC']})
-		df_pC = df_pC.set_index("year")
-		# Sélection des quantiles
-		vInf = np.percentile(cons_calc()[0], qInf, axis=1)
-		vSup = np.percentile(cons_calc()[0], qSup, axis=1)
-		df_pC["q%s" % int(qInf)] = vInf[:,0]
-		df_pC["q%s" % int(qSup)] = vSup[:,0]
-
-		return df_pC
-
-	@reactive.calc
-	def p1_calc():
-		df_pF = pd.DataFrame({"year": cons_calc()[0].time , "pF": cons_calc()[0].loc[:,'BE','pF']})
-		df_pF = df_pF.set_index("year")
-		# Sélection des quantiles
-		vInf = np.percentile(cons_calc()[0], qInf, axis=1)
-		vSup = np.percentile(cons_calc()[0], qSup, axis=1)
-		df_pF["q%s" % int(qInf)] = vInf[:,1]
-		df_pF["q%s" % int(qSup)] = vSup[:,1]
-
-		return df_pF
-
-	@reactive.calc
-	def pr_calc():
-		df_PR = pd.DataFrame({"year": cons_calc()[0].time , "PR": cons_calc()[0].loc[:,'BE','PR']})
-		df_PR = df_PR.set_index("year")
-		# Sélection des quantiles
-		vInf = np.percentile(cons_calc()[0], qInf, axis=1)
-		vSup = np.percentile(cons_calc()[0], qSup, axis=1)
-		df_PR["q%s" % int(qInf)] = vInf[:,4]
-		df_PR["q%s" % int(qSup)] = vSup[:,4]
-
-		return df_PR
-
-	@render_widget
+	@render.plot
 	def plot_ts():  
 
 		if not input.coord_lat():
@@ -491,140 +502,238 @@ def server(input, output, session):
 
 		## Load models and observations
 		##=============================
-		Xo,Yo = load_obs( pathInp , lat_sub, lon_sub )
+		Xo,Yo,lat_real,lon_real = load_obs( pathInp , lat_sub, lon_sub )
 
-		fig_ts = go.Figure()
+		mm     = 1. / 25.4
+		ratio  = 16 / 11
+		nrow   = 1
+		ncol   = 1
+		width  = 180*mm
+		height = width / ncol / ratio * nrow
 
-		fig_ts.add_trace(go.Scatter(
-			x=Yo.index.values,
-			y=Yo.values.ravel()-273.15,
-			yhoverformat='.1f',
-			mode='lines+markers',
-			line=dict(color="black"),
-			hoveron='points',
-			name="Observations"
-		))
+		#pdf = mpdf.PdfPages( "era5_lat"+str(round(lat_sub,2))+"_lon"+str(round(lon_sub,2))+".pdf" )
 
-		fig_ts.update_layout(title="Observed "+input.var_nx()+" ("+input.duration()+"-day mean) at "+str(round(lat_sub,2))+"°N / "+str(round(lon_sub,2))+" °E")
-		fig_ts.update_xaxes(title_text='year')
-		fig_ts.update_yaxes(title_text='°C')
+		fig = plt.figure( figsize = (width,height) )
+		ax  = fig.add_subplot( nrow , ncol , 1 )
+		ax.plot( Yo-273.15 , color = "black" )
+		ax.set_ylabel("°C")
+		ax.set_xlabel("Year")
+		ax.set_title("ERA5 annual "+input.duration()+"-day mean "+input.var_nx()+" at ["+str(lat_real)+"°N ; "+str(lon_real)+" °E]")
+		plt.tight_layout()
 
-		return fig_ts
+		#pdf.savefig( fig )
+		#plt.close(fig)
+		#pdf.close()
 
-	@render_widget
+		return fig
+	
+	@render.data_frame  
+	def proba_df():
+		
+		stats = cons_calc()[0]
+		ci = 0.05
+		qstats = stats.quantile( [ci / 2 ,  0.5 , 1 - ci / 2 ] , dim = "sample_MCMC" ).assign_coords( quantile = [ "ql" , "be" , "qu" ] )
+		qstats.loc["be",:,"PR"] = stats.loc[:,"BE","PR"]
+		
+		prop_PR_not_valid = ( ~(stats.loc[:,:,"pF"] > 0) & ~(stats.loc[:,:,"pC"] > 0) ).sum( dim = "sample_MCMC" ) / ( stats.sample_MCMC.size - 1 )
+		PR_not_valid = prop_PR_not_valid > ci
+
+		qstats.loc["ql",PR_not_valid,"PR"] = 0
+		qstats.loc["be",PR_not_valid,"PR"] = 1
+		qstats.loc["qu",PR_not_valid,"PR"] = np.inf
+
+		qstats.loc["ql",~np.isfinite(qstats.loc["ql",:,"PR"]),"PR"] = 0
+		#qstats.loc["be",~np.isfinite(qstats.loc["be",:,"PR"]),"PR"] = 1
+		qstats.loc["qu",~np.isfinite(qstats.loc["qu",:,"PR"]),"PR"] = np.inf
+
+		df = pd.DataFrame({"Probability for "+str(input.year()) : ["pF","pC","pR"] , "Q05": qstats.loc["ql",input.year(),["pF","pC","PR"]], "Best estimate": qstats.loc["be",input.year(),["pF","pC","PR"]], "Q95": qstats.loc["qu",input.year(),["pF","pC","PR"]]})
+		df = df.replace([np.inf], ["Inf"])
+		return render.DataGrid(df)  
+	
+	@render.plot
 	def plot_proba():
 
-		fig_pb = go.Figure()
+		stats = cons_calc()[0]
+		ci = 0.05
+		qstats = stats.quantile( [ci / 2 ,  0.5 , 1 - ci / 2 ] , dim = "sample_MCMC" ).assign_coords( quantile = [ "ql" , "be" , "qu" ] )
 
-		fig_pb.add_trace(go.Scatter(
-			x=np.concatenate([p0_calc().index.values, p0_calc().index.values[::-1]]),
-			y=np.concatenate([p0_calc()["q95"], p0_calc()["q5"][::-1]]),
-			yhoverformat='.2f',
-			fill='toself',
-			hoveron='points',
-			line=dict(color="blue"),
-			showlegend=False,
-			name="Confidence interval (95%)"
-		))
+		mm     = 1. / 25.4
+		ratio  = 16 / 11
+		nrow   = 1
+		ncol   = 1
+		width  = 180*mm
+		height = width / ncol / ratio * nrow
 
-		fig_pb.add_trace(go.Scatter(
-			x=np.concatenate([p1_calc().index.values, p1_calc().index.values[::-1]]),
-			y=np.concatenate([p1_calc()["q95"], p1_calc()["q5"][::-1]]),
-			yhoverformat='.2f',
-			fill='toself',
-			hoveron='points',
-			line=dict(color="red"),
-			showlegend=False,
-			name="Confidence interval (95%)"
-		))
+		colors = ["red","blue"]
+		yticks = np.array([0,1e-12,1e-6,1e-3,1e-2,1/30,1/10,0.2,0.5,1] )
+		yticklabelsL = ["0",r"$10^{-12}$",r"$10^{-6}$",r"$10^{-3}$",r"$10^{-2}$","1/30","1/10","1/5","1/2","1"]
+		yticklabelsR = [r"$\infty$","","","1000","100","30","10","5","2","1"]
 
-		fig_pb.add_trace(go.Scatter(
-			x=p0_calc().index.values,
-			y=p0_calc()["pC"],
-			yhoverformat='.2f',
-			mode='lines',
-			line=dict(color="blue"),
-			hoveron='points',
-			name="Pre-industrial climate"
-		))
 
-		fig_pb.add_trace(go.Scatter(
-			x=p1_calc().index.values,
-			y=p1_calc()["pF"],
-			yhoverformat='.2f',
-			mode='lines',
-			line=dict(color="red"),
-			hoveron='points',
-			name="Historical+SSP5-8.5 CMIP6"
-		))
+		fig = plt.figure( figsize = (width,height) )
+		ax  = fig.add_subplot( nrow , ncol , 1 )
+		for iqp,qp in enumerate([qstats.loc[:,:,"pF"],qstats.loc[:,:,"pC"]]):
+			ax.plot( qp.time , plink(qp.loc["be",:]) , color = colors[iqp] )
+			ax.fill_between( qp.time , plink(qp.loc["ql",:]) , plink(qp.loc["qu",:]) , color = colors[iqp] , alpha = 0.5 )
+		ax.set_yticks(plink(yticks))
+		ax.set_yticklabels(yticklabelsL)
+		ax.set_ylabel("Probability")
+		ax.set_ylim(plink([0,1]))
 
-		fig_pb.update_yaxes(title_text="Probability")
-		fig_pb.update_layout(title="Probabilities for an event of "+str(cons_calc()[1])+"°C at "+str(round(cons_calc()[2],2))+"°N / "+str(round(cons_calc()[3],2))+" °E")
+		axR = fig.add_subplot( nrow , ncol , 1 , sharex = ax , frameon = False )
+		axR.yaxis.tick_right()
+		axR.set_yticks(plink(yticks))
+		axR.set_yticklabels(yticklabelsR)
+		axR.yaxis.set_label_position( "right" )
+		axR.set_ylabel( "Return period" , rotation = 270 )
+		ax.set_ylim(plink([0,1]))
 
-		return fig_pb
+		ax.set_title("Probabilities for an event of "+str(cons_calc()[1])+"°C at "+str(cons_calc()[2])+"°N / "+str(cons_calc()[3])+" °E")
+		label = ["Factual", "Counterfactual"]
+		legend = [mplpatch.Patch(facecolor = c , edgecolor = c , label = l , alpha = 0.5 ) for c,l in zip(["red","blue"],label)]
+		ax.legend( handles = legend , loc = "upper left" )
 
-	@render_widget
+
+		plt.tight_layout()
+
+		return fig
+
+	@render.plot
 	def plot_far():
 
-		# FAR
-		fig_far = go.Figure()
-		fig_far = make_subplots(specs=[[{"secondary_y": True}]])
-
-		fig_far.add_trace(go.Scatter(
-			x=p1_calc().index.values,
-			y=pr_calc()["PR"],
-			yhoverformat='.2f',
-			mode='lines',
-			line=dict(color="blue"),
-			hoveron='points',
-			name="Probability ratio"
-		), secondary_y=False)
-
-		FAR = 1 - 1/pr_calc()["PR"]
-
-		fig_far.add_trace(go.Scatter(
-			x=p0_calc().index.values,
-			y=FAR,
-			yhoverformat='.2f',
-			mode='lines',
-			line=dict(color="green"),
-			hoveron='points',
-			name="FAR"
-		), secondary_y=True)
-
-		fig_far.update_yaxes(title_text="Probability ratio", secondary_y=False)
-		fig_far.update_yaxes(title_text="FAR", secondary_y=True)
-		fig_far.update_layout(title="Best estimates for FAR and PR for an event of "+str(cons_calc()[1])+"°C at "+str(round(cons_calc()[2],2))+"°N / "+str(round(cons_calc()[3],2))+" °E")
-
-		return fig_far
-
-	@reactive.effect
-	def _():
-		plot_proba.widget.layout.annotations=[]
-		plot_proba.widget.layout.shapes=[]
-		plot_proba.widget.add_vline(x = input.year(), line_width=3, line_dash="dot",annotation_text=str(input.year()), 
-			annotation_position="bottom right",
-			line_color="blue")
-		plot_far.widget.layout.annotations=[]
-		plot_far.widget.layout.shapes=[]
-		plot_far.widget.add_vline(x = input.year(), line_width=3, line_dash="dot",annotation_text=str(input.year()), 
-			annotation_position="bottom right",
-			line_color="blue")
-		plot_dr.widget.layout.annotations=[]
-		plot_dr.widget.layout.shapes=[]
-		plot_dr.widget.add_vline(x = input.year(), line_width=3, line_dash="dot",annotation_text=str(input.year()), 
-			annotation_position="bottom right",
-			line_color="blue")
-		plot_rl.widget.layout.annotations=[]
-		plot_rl.widget.layout.shapes=[]
-		plot_rl.widget.add_vline(x = input.year(), line_width=3, line_dash="dot",annotation_text=str(input.year()), 
-			annotation_position="bottom right",
-			line_color="blue")
+		stats = cons_calc()[0]
+		ci = 0.05
+		qstats = stats.quantile( [ci / 2 ,  0.5 , 1 - ci / 2 ] , dim = "sample_MCMC" ).assign_coords( quantile = [ "ql" , "be" , "qu" ] )
+		qstats.loc["be",:,"PR"] = stats.loc[:,"BE","PR"]
 		
-		 
+		prop_PR_not_valid = ( ~(stats.loc[:,:,"pF"] > 0) & ~(stats.loc[:,:,"pC"] > 0) ).sum( dim = "sample_MCMC" ) / ( stats.sample_MCMC.size - 1 )
+		PR_not_valid = prop_PR_not_valid > ci
+
+		qstats.loc["ql",PR_not_valid,"PR"] = 0
+		qstats.loc["be",PR_not_valid,"PR"] = 1
+		qstats.loc["qu",PR_not_valid,"PR"] = np.inf
+
+		qstats.loc["ql",~np.isfinite(qstats.loc["ql",:,"PR"]),"PR"] = 0
+		#qstats.loc["be",~np.isfinite(qstats.loc["be",:,"PR"]),"PR"] = 1
+		qstats.loc["qu",~np.isfinite(qstats.loc["qu",:,"PR"]),"PR"] = np.inf
+		
+		mm     = 1. / 25.4
+		ratio  = 16 / 11
+		nrow   = 1
+		ncol   = 1
+		width  = 180*mm
+		height = width / ncol / ratio * nrow
+
+		yticks       = np.array([0 , 1e-3 , 1e-2 , 1e-1 , 1 , 5 , 10 , 100 , 1000 , np.inf])
+		yticklabelsL = np.array(["0",r"$10^{-3}$",r"$10^{-2}$",r"$10^{-1}$","1","5","10","100","1000",r"$\infty$"])
+		yticklabelsR = np.array([r"$-\infty$", "-999" , "-99","-9","0","0.8","0.9","0.99","0.999","1"])
+
+		fig = plt.figure( figsize = (width,height) )
+		ax  = fig.add_subplot(1,1,1)
+		ax.plot( qstats.time , PRlink(qstats.loc["be",:,"PR"]) , color = "red" )
+		ax.fill_between( qstats.time , PRlink(qstats.loc["ql",:,"PR"]) , PRlink(qstats.loc["qu",:,"PR"]) , color = "red" , alpha = 0.5 )
+		ax.set_yticks(PRlink(yticks))
+		ax.set_yticklabels(yticklabelsL)
+		ax.set_ylabel("Probability ratio")
+		ax.set_ylim(PRlink([0,np.inf]))
+
+		axR = fig.add_subplot( 1 , 1 , 1 , sharex = ax , frameon = False )
+		axR.yaxis.tick_right()
+		axR.set_yticks(PRlink(yticks))
+		axR.set_yticklabels(yticklabelsR)
+		axR.yaxis.set_label_position( "right" )
+		axR.set_ylabel( "FAR" , rotation = 270 )
+		axR.set_ylim(PRlink([0,np.inf]))
+
+		plt.tight_layout()
+		return fig
+
+	@render.plot
+	def plot_param():
+
+		climMM = cons_calc()[5]
+		climCXCB = cons_calc()[6]
+
+		ci=0.05
+		qcoefc = climCXCB.law_coef[:,1:,:].quantile( [ci/2,1-ci/2,0.5] , dim = "sample_MCMC" ).assign_coords( quantile = ["ql","qu","BE"] )
+		qcoef  = climMM.law_coef[:,1:,:].quantile( [ci/2,1-ci/2,0.5] , dim = "sample" ).assign_coords( quantile = ["ql","qu","BE"] )
+
+		qcoefc.loc[["ql","qu"],:,:] = qcoefc.loc[["ql","qu"],:,:] - qcoefc.loc["BE",:,:]
+		qcoef = qcoef - qcoefc.loc["BE",:,:]
+
+		## mpl parameter
+		ymin = min( (climCXCB.law_coef - qcoefc.loc["BE",:,:]).min() , (climMM.law_coef - qcoefc.loc["BE",:,:]).min() )
+		ymax = max( (climCXCB.law_coef - qcoefc.loc["BE",:,:]).max() , (climMM.law_coef - qcoefc.loc["BE",:,:]).max() )
+		delta = 0.1 * (ymax-ymin)
+		ylim = (ymin-delta,ymax+delta)
+
+		label = ["Prior distribution", "Posterior"]
+		legend = [mplpatch.Patch(facecolor = c , edgecolor = c , label = l , alpha = 0.5 ) for c,l in zip(["pink","red"],label)]
+		#	legend.append( mplpatch.Patch(facecolor = "red"  , edgecolor = "red"  , label = "clim"       , alpha = 0.5 ) )
+		#	legend.append( mplpatch.Patch(facecolor = "blue" , edgecolor = "blue" , label = "clim_const" , alpha = 0.5 ) )
+
+
+		kwargs = { "positions" : range(climCXCB.n_coef) , "showmeans" : False , "showextrema" : False , "showmedians" : False }
+
+
+		mm     = 1. / 25.4
+		ratio  = 16 / 11
+		nrow   = 1
+		ncol   = 1
+		width  = 180*mm
+		height = width / ncol / ratio * nrow
+
+		fig = plt.figure( figsize = (width,height) )
+		ax  = fig.add_subplot(1,1,1)
+
+		## violin plot
+		vplotc = ax.violinplot( (climCXCB.law_coef - qcoefc.loc["BE",:,:])[:,1:,:].loc[:,:,"Multi_Synthesis"].values.T , **kwargs )
+		vplot  = ax.violinplot( (climMM.law_coef - qcoefc.loc["BE",:,:])[:,1:,:].loc[:,:,"Multi_Synthesis"].values.T , **kwargs )
+
+		## Change color
+		for pc in vplotc["bodies"]:
+			pc.set_facecolor("red")
+			pc.set_edgecolor("red")
+			pc.set_alpha(0.5)
+
+		for pc in vplot["bodies"]:
+			pc.set_facecolor("pink")
+			pc.set_edgecolor("pink")
+			pc.set_alpha(0.4)
+
+		# add quantiles
+		for i in range(climCXCB.n_coef):
+			for q in ["ql","qu"]:
+				ax.hlines( qcoefc[:,i,:].loc[q,"Multi_Synthesis"] , i - 0.3 , i + 0.3 , color = "red" )
+			for q in ["ql","qu","BE"]:
+				ax.hlines( qcoef[:,i,:].loc[q,"Multi_Synthesis"] , i - 0.3 , i + 0.3 , color = "pink" )
+
+		ax.hlines( 0 , -0.5 , climCXCB.n_coef-0.5 , color = "black" )
+		for i in range(climCXCB.n_coef-1):
+			ax.vlines( i + 0.5 , ylim[0] , ylim[1] , color = "grey" )
+
+		## some params
+		ax.set_xlim((-0.5,climCXCB.n_coef-0.5))
+		ax.set_xticks(range(climCXCB.n_coef))
+		xticks = [ "{}".format(p) + "{}".format( "-" if np.sign(q) > 0 else "+" ) + r"${}$".format(float(np.sign(q)) * round(float(q),2)) for p,q in zip(climCXCB.ns_law.get_params_names(True),qcoefc.loc["BE",:,"Multi_Synthesis"]) ]
+		ax.set_xticklabels( xticks )#, fontsize = 20 )
+		#for item in ax.get_yticklabels():
+	#		item.set_fontsize(20)
+		ax.set_ylim(ylim)
+
+		ax.set_title( "GEV parameters "  )
+		ax.legend( handles = legend  )
+
+		fig.set_tight_layout(True)
+
+		return fig
+
+
 	@reactive.calc
 	@reactive.event(input.go_dr, ignore_none=True, ignore_init=True)
 	def dr_calc():
+
+		set_seed: np.random.seed(1)
 
 		input.go_dr()
 
@@ -638,7 +747,7 @@ def server(input, output, session):
 
 		## Load models and observations
 		##=============================
-		Xo,Yo_tmp = load_obs( pathInp , lat_sub, lon_sub )
+		Xo,Yo_tmp,lat_real,lon_real = load_obs( pathInp , lat_sub, lon_sub )
 
 		## Anomaly from observations
 		##==========================
@@ -657,7 +766,7 @@ def server(input, output, session):
 
 		## Multi-model
 		##============
-		climMM_file = os.path.join( pathInp , "climMM_lat%s_lon%s.nc" % (idx_lat,idx_lon) )
+		climMM_file = os.path.join( pathInp , "climMM/climMM_lat%s_lon%s.nc" % (idx_lat,idx_lon) )
 		climMM = ns.Climatology.from_netcdf( climMM_file, ns_law )
 
 		## Apply constraints
@@ -665,7 +774,7 @@ def server(input, output, session):
 		climCX     = ns.constrain_covariate( climMM , Xo , time_reference , assume_good_scale = True, verbose = verbose )
 
 		bayes_kwargs = { "n_ess"   : int(10000/(len(climCX.data.sample)-1))   } #Ici produit 10000 tirages en tout
-		climCXCB = ns.stan_constrain(climCX,Yo,'stan_files/GEV_non_stationary.stan', **bayes_kwargs)
+		climCXCB = ns.stan_constrain(climCX,Yo,'stan_files/GEV_non_stationary.stan', install_dir="/d0/www-ubuntu-extreme-event-app2025/.cmdstan/cmdstan-2.36.0", **bayes_kwargs)
 
 		## Stats
 		upper_side = "upper"
@@ -676,67 +785,76 @@ def server(input, output, session):
 		nsample_MCMC = climCXCB.data.sample_MCMC.shape[0]
 		samples_MCMC = climCXCB.data.sample_MCMC
 
-		rl_cons = xr.DataArray( np.zeros( (ny,nsample_MCMC) ) , coords = [climCXCB.X.time , samples_MCMC] , dims = ["time","sample"] )
-		law_cons = climCXCB.ns_law
+		## Output
+		n_stat = 3
+		stats = xr.DataArray( np.zeros( (ny,nsample_MCMC,n_stat) ) , coords = [climCXCB.X.time , samples_MCMC , ["IF","IC","dI"] ] , dims = ["time","sample_MCMC","stats"] )
 
-		for s_MCMC in samples_MCMC:
-			
-			s_X = str(s_MCMC.values).split("_")[0]
-
-			## Start with params
-			law_cons.set_params( climCXCB.law_coef.loc[:,s_MCMC,'Multi_Synthesis'].values )
-
-			## Go to factual world
-			law_cons.set_covariable( climCXCB.X.loc[:,s_X,"F",'Multi_Synthesis'].values , climCXCB.time )
-
-			## Find value of event definition
-			rl_cons.loc[:,s_MCMC] = np.repeat(bias["Multi_Synthesis"].values,ny) + law_cons.isf( 1./p , climCXCB.time ) #if upper_side else law.icdf( pF , event.time ) )
+		XF = xr.DataArray( np.tile(climCXCB.X.loc[:,"BE","F","Multi_Synthesis"], (nsample_MCMC, 1)).T, coords = [climCXCB.X.time , samples_MCMC  ] , dims = ["time","sample_MCMC"] )
+		XC = xr.DataArray( np.tile(climCXCB.X.loc[:,"BE","C","Multi_Synthesis"], (nsample_MCMC, 1)).T, coords = [climCXCB.X.time , samples_MCMC  ] , dims = ["time","sample_MCMC"] )
 		
-		print("rp done")            
-		return rl_cons
+		locF  = climCXCB.law_coef.loc["loc0",:,"Multi_Synthesis"] + XF * climCXCB.law_coef.loc["loc1",:,"Multi_Synthesis"]
+		locC  = climCXCB.law_coef.loc["loc0",:,"Multi_Synthesis"] + XC * climCXCB.law_coef.loc["loc1",:,"Multi_Synthesis"]
+		scaleF = np.exp(climCXCB.law_coef.loc["scale0",:,"Multi_Synthesis"] + XF * climCXCB.law_coef.loc["scale1",:,"Multi_Synthesis"])
+		scaleC = np.exp(climCXCB.law_coef.loc["scale0",:,"Multi_Synthesis"] + XC * climCXCB.law_coef.loc["scale1",:,"Multi_Synthesis"])
+		shape = climCXCB.law_coef.loc["shape0",:,"Multi_Synthesis"] + xr.zeros_like(locF)
 
-	@render_widget
+		p_user = p + xr.zeros_like(locF)
+		bias_md = xr.DataArray( np.tile(np.repeat(bias["Multi_Synthesis"].values - 273.15,ny), (nsample_MCMC, 1)).T, coords = [climCXCB.X.time , samples_MCMC  ] , dims = ["time","sample_MCMC"] )
+		stats.loc[:,:,"IF"] = sc.genextreme.isf( 1/p_user , loc = locF , scale = scaleF , c = - shape ).T + bias_md
+		stats.loc[:,:,"IC"] = sc.genextreme.isf( 1/p_user , loc = locC , scale = scaleC , c = - shape ).T + bias_md
+		## deltaI
+		stats.loc[:,:,"dI"] = stats.loc[:,:,"IF"] - stats.loc[:,:,"IC"]
+
+		return stats, lat_real, lon_real
+	
+	@render.data_frame  
+	def rl_df():
+
+		stats = dr_calc()[0]
+		qstats = stats.quantile( [ci / 2 ,  0.5 , 1 - ci / 2 ] , dim = "sample_MCMC" ).assign_coords( quantile = [ "ql" , "be" , "qu" ] )
+
+		df = pd.DataFrame({"Return level estimated in "+str(input.year()) : ["Factual" , "Counterfactual", "Difference"] , "Q05": qstats.loc["ql",input.year(),["IF","IC","dI"]], "Best estimate": qstats.loc["be",input.year(),["IF","IC","dI"]], "Q95": qstats.loc["qu",input.year(),["IF","IC","dI"]]})
+		return render.DataGrid(df)  
+
+	@render.plot
 	def plot_dr():
 
-		txx_cons = pd.DataFrame({"year": dr_calc().time , "return_level": dr_calc().loc[:,'BE']})
-		txx_cons = txx_cons.set_index("year")
+		stats = dr_calc()[0]
+		ci = 0.05
+		qstats = stats.quantile( [ci / 2 ,  0.5 , 1 - ci / 2 ] , dim = "sample_MCMC" ).assign_coords( quantile = [ "ql" , "be" , "qu" ] )
 
-		vInf = np.percentile(dr_calc(), qInf, axis=1)
-		vSup = np.percentile(dr_calc(), qSup, axis=1)
-		txx_cons["q%s" % int(qInf)] = vInf
-		txx_cons["q%s" % int(qSup)] = vSup
+		mm     = 1. / 25.4
+		ratio  = 16 / 11
+		nrow   = 1
+		ncol   = 2
+		width  = 210*mm
+		height = width / ncol / ratio * nrow
 
-		fig_dr = go.Figure()
+		fig = plt.figure( figsize = (width,height) )
 
-		fig_dr.add_trace(go.Scatter(
-			x=np.concatenate([txx_cons.index.values, txx_cons.index.values[::-1]]),
-			y=np.concatenate([txx_cons["q95"], txx_cons["q5"][::-1]]),
-			yhoverformat='.2f',
-			fill='toself',
-			hoveron='points',
-			line=dict(color="blue"),
-			showlegend=False,
-			name="Confidence interval (95%)"
-		))
+		ax = fig.add_subplot( nrow , ncol , 1 )
+		ax.plot( qstats.time , qstats.loc["be",:,"IC"], color = "blue" )
+		ax.plot( qstats.time , qstats.loc["be",:,"IF"] , color = "red"  )
+		ax.fill_between( qstats.time , qstats.loc["ql",:,"IC"] , qstats.loc["qu",:,"IC"] , color = "blue" , alpha = 0.5 )
+		ax.fill_between( qstats.time , qstats.loc["ql",:,"IF"] , qstats.loc["qu",:,"IF"] , color = "red"  , alpha = 0.5 )
+		ax.set_ylabel("Return level")
+		
+		ax.set_title("Return level of a "+str(input.dr())+"-year event at ["+str(dr_calc()[1])+"°N ; "+str(dr_calc()[2])+" °E]")
 
-		fig_dr.add_trace(go.Scatter(
-			x=txx_cons.index.values,
-			y=txx_cons["return_level"],
-			yhoverformat='.2f',
-			mode='lines',
-			line=dict(color="blue"),
-			hoveron='points',
-			name="Return level"
-		))
+		#ax = fig.add_subplot( nrow , ncol , 2 )
+		#ax.plot( qdI.time , qdI.loc["BE",:] , color = "red" )
+		#ax.fill_between( qdI.time , qdI.loc["QL",:] , qdI.loc["QU",:] , color = "red"  , alpha = 0.5 )
 
-		fig_dr.update_yaxes(title_text="Temperature (°C)")
-		#fig_dr.update_layout(title="Return period of "+str(input.year())+" years at "+str(round(cons_calc()[2],2))+"°N / "+str(round(cons_calc()[3],2))+" °E")
+		plt.tight_layout()
 
-		return fig_dr
+
+		return fig
 
 	@reactive.calc
 	@reactive.event(input.go_rl, ignore_none=True, ignore_init=True)
 	def rl_calc():
+
+		set_seed: np.random.seed(1)
 
 		input.go_rl()
 
@@ -750,7 +868,16 @@ def server(input, output, session):
 
 		## Load models and observations
 		##=============================
-		Xo,Yo_tmp = load_obs( pathInp , lat_sub, lon_sub )
+		Xo,Yo_tmp,lat_real,lon_real = load_obs( pathInp , lat_sub, lon_sub )
+
+		if not input.rl_val():
+			raise Exception("A numeric value is required")
+
+		val_max = np.mean(Yo_tmp.values) + 4*np.std(Yo_tmp.values)
+		val_min = np.min(Yo_tmp.values)
+		
+		if rl_user > val_max or rl_user < val_min:
+			raise Exception("A realistic value is required")
 
 		## Anomaly from observations
 		##==========================
@@ -769,7 +896,7 @@ def server(input, output, session):
 
 		## Multi-model
 		##============
-		climMM_file = os.path.join( pathInp , "climMM_lat%s_lon%s.nc" % (idx_lat,idx_lon) )
+		climMM_file = os.path.join( pathInp , "climMM/climMM_lat%s_lon%s.nc" % (idx_lat,idx_lon) )
 		climMM = ns.Climatology.from_netcdf( climMM_file, ns_law )
 
 		## Apply constraints
@@ -777,10 +904,9 @@ def server(input, output, session):
 		climCX     = ns.constrain_covariate( climMM , Xo , time_reference , assume_good_scale = True, verbose = verbose )
 
 		bayes_kwargs = { "n_ess"   : int(10000/(len(climCX.data.sample)-1))   } #Ici produit 10000 tirages en tout
-		climCXCB = ns.stan_constrain(climCX,Yo,'stan_files/GEV_non_stationary.stan', **bayes_kwargs)
+		climCXCB = ns.stan_constrain(climCX,Yo,'stan_files/GEV_non_stationary.stan', install_dir="/d0/www-ubuntu-extreme-event-app2025/.cmdstan/cmdstan-2.36.0", **bayes_kwargs)
 
 		## Stats
-		upper_side = "upper"
 		time = climCXCB.time
 		ny = climCXCB.n_time
 		nsample = climCXCB.n_sample
@@ -790,64 +916,191 @@ def server(input, output, session):
 
 		rl = rl_user-bias["Multi_Synthesis"].values
 
-		rp_cons = xr.DataArray( np.zeros( (ny,nsample_MCMC) ) , coords = [climCXCB.X.time , samples_MCMC ] , dims = ["time","sample"] )
-		law_cons = climCXCB.ns_law
+		## Output
+		n_stat = 3
+		stats = xr.DataArray( np.zeros( (ny,nsample_MCMC,n_stat) ) , coords = [climCXCB.X.time , samples_MCMC , ["pC","pF", "PR"] ] , dims = ["time","sample_MCMC","stats"] )
+		#stats_pr = xr.DataArray( np.zeros( (ny,nsample_MCMC) ) , coords = [climCXCB.X.time , samples_MCMC , ["pC","pF", "PR"] ] , dims = ["time","sample_MCMC","stats"] )
 
-		for s_MCMC in samples_MCMC:
-			
-			s_X = str(s_MCMC.values).split("_")[0]
+		XF = xr.DataArray( np.tile(climCXCB.X.loc[:,"BE","F","Multi_Synthesis"], (nsample_MCMC, 1)).T, coords = [climCXCB.X.time , samples_MCMC  ] , dims = ["time","sample_MCMC"] )
+		XC = xr.DataArray( np.tile(climCXCB.X.loc[:,"BE","C","Multi_Synthesis"], (nsample_MCMC, 1)).T, coords = [climCXCB.X.time , samples_MCMC  ] , dims = ["time","sample_MCMC"] )
+		
+		locF  = climCXCB.law_coef.loc["loc0",:,"Multi_Synthesis"] + XF * climCXCB.law_coef.loc["loc1",:,"Multi_Synthesis"]
+		locC  = climCXCB.law_coef.loc["loc0",:,"Multi_Synthesis"] + XC * climCXCB.law_coef.loc["loc1",:,"Multi_Synthesis"]
+		scaleF = np.exp(climCXCB.law_coef.loc["scale0",:,"Multi_Synthesis"] + XF * climCXCB.law_coef.loc["scale1",:,"Multi_Synthesis"])
+		scaleC = np.exp(climCXCB.law_coef.loc["scale0",:,"Multi_Synthesis"] + XC * climCXCB.law_coef.loc["scale1",:,"Multi_Synthesis"])
+		shape = climCXCB.law_coef.loc["shape0",:,"Multi_Synthesis"] + xr.zeros_like(locF)
 
-			## Start with params
-			law_cons.set_params( climCXCB.law_coef.loc[:,s_MCMC,'Multi_Synthesis'].values )
+		stats.loc[:,:,"pF"] = sc.genextreme.sf( rl , loc = locF , scale = scaleF , c = - shape ).T
+		stats.loc[:,:,"pC"] = sc.genextreme.sf( rl , loc = locC , scale = scaleC , c = - shape ).T
+		## PR
+		stats_pr = stats.loc[:,:,"pF"] / stats.loc[:,:,"pC"]
 
-			## Go to factual world
-			law_cons.set_covariable( climCXCB.X.loc[:,s_X,"F",'Multi_Synthesis'].values , climCXCB.time )
-
-			## Find value of event definition
-			rp_cons.loc[:,s_MCMC] = 1/law_cons.sf( rl , climCXCB.time ) #if upper_side else law.icdf( pF , event.time ) )
-
-		print("rl done")    
-		return rp_cons
+		return stats, stats_pr, lat_real, lon_real, climMM, climCXCB
 	
-	@render_widget
+	@render.data_frame  
+	def rp_df():
+
+		stats = 1/rl_calc()[0]
+		qstats = stats.quantile( [ci / 2 ,  0.5 , 1 - ci / 2 ] , dim = "sample_MCMC" ).assign_coords( quantile = [ "ql" , "be" , "qu" ] )
+
+		stats_pr = rl_calc()[1]
+		qstats_pr = stats_pr.quantile( [ci / 2 ,  0.5 , 1 - ci / 2 ] , dim = "sample_MCMC" ).assign_coords( quantile = [ "ql" , "be" , "qu" ] )
+
+		qstats.loc[:,:,"PR"] = qstats_pr
+		qstats.loc["be",:,"PR"] = stats_pr.loc[:,"BE"]
+		
+		prop_PR_not_valid = ( ~(stats.loc[:,:,"pF"] > 0) & ~(stats.loc[:,:,"pC"] > 0) ).sum( dim = "sample_MCMC" ) / ( stats.sample_MCMC.size - 1 )
+		PR_not_valid = prop_PR_not_valid > ci
+
+		qstats.loc["ql",PR_not_valid,"PR"] = 0
+		qstats.loc["be",PR_not_valid,"PR"] = 1
+		qstats.loc["qu",PR_not_valid,"PR"] = np.inf
+
+		qstats.loc["ql",~np.isfinite(qstats.loc["ql",:,"PR"]),"PR"] = 0
+		#qstats.loc["be",~np.isfinite(qstats.loc["be",:,"PR"]),"PR"] = 1
+		qstats.loc["qu",~np.isfinite(qstats.loc["qu",:,"PR"]),"PR"] = np.inf
+
+		#df = pd.DataFrame({"Probability for "+str(input.year()) : ["pF","pC","pR"] , "Q05": qstats.loc["ql",input.year(),["pF","pC","PR"]], "Best estimate": qstats.loc["be",input.year(),["pF","pC","PR"]], "Q95": qstats.loc["qu",input.year(),["pF","pC","PR"]]})
+
+		df = pd.DataFrame({"Return period estimated in "+str(input.year()) : ["Factual" , "Counterfactual", "Ratio"] , "Q05": qstats.loc["ql",input.year(),["pF","pC","PR"]], "Best estimate": qstats.loc["be",input.year(),["pF","pC","PR"]], "Q95": qstats.loc["qu",input.year(),["pF","pC","PR"]]})
+		df = df.replace([np.inf], ["Inf"])
+		return render.DataGrid(df)  
+		
+	@render.plot
 	def plot_rl():
 
-		txx_cons = pd.DataFrame({"year": rl_calc().time , "return_period": rl_calc().loc[:,'BE']})
-		txx_cons = txx_cons.set_index("year")
+		stats = rl_calc()[0]
+		ci = 0.05
+		qstats = stats.quantile( [ci / 2 ,  0.5 , 1 - ci / 2 ] , dim = "sample_MCMC" ).assign_coords( quantile = [ "ql" , "be" , "qu" ] )
 
-		# Sélection des quantiles
-		vInf = np.percentile(rl_calc(), qInf, axis=1)
-		vSup = np.percentile(rl_calc(), qSup, axis=1)
-		txx_cons["q%s" % int(qInf)] = vInf
-		txx_cons["q%s" % int(qSup)] = vSup
+		mm     = 1. / 25.4
+		ratio  = 16 / 11
+		nrow   = 1
+		ncol   = 1
+		width  = 180*mm
+		height = width / ncol / ratio * nrow
 
-		fig_dr = go.Figure()
+		colors = ["red","blue"]
+		yticks = np.array([0,1e-12,1e-6,1e-3,1e-2,1/30,1/10,0.2,0.5,1] )
+		yticklabelsL = ["0",r"$10^{-12}$",r"$10^{-6}$",r"$10^{-3}$",r"$10^{-2}$","1/30","1/10","1/5","1/2","1"]
+		yticklabelsR = [r"$\infty$","","","1000","100","30","10","5","2","1"]
 
-		fig_dr.add_trace(go.Scatter(
-			x=np.concatenate([txx_cons.index.values, txx_cons.index.values[::-1]]),
-			y=np.concatenate([txx_cons["q95"], txx_cons["q5"][::-1]]),
-			yhoverformat='.2f',
-			fill='toself',
-			hoveron='points',
-			line=dict(color="blue"),
-			showlegend=False,
-			name="Confidence interval (95%)"
-		))
+		#pdf = mpdf.PdfPages( "return_period_lat"+str(round(rl_calc()[2],2))+"_lon"+str(round(rl_calc()[3],2))+".pdf" )
 
-		fig_dr.add_trace(go.Scatter(
-			x=txx_cons.index.values,
-			y=txx_cons["return_period"],
-			yhoverformat='.2f',
-			mode='lines',
-			line=dict(color="blue"),
-			hoveron='points',
-			name="Return period"
-		))
+		fig = plt.figure( figsize = (width,height) )
+		ax  = fig.add_subplot( nrow , ncol , 1 )
+		for iqp,qp in enumerate([qstats.loc[:,:,"pF"],qstats.loc[:,:,"pC"]]):
+			ax.plot( qp.time , plink(qp.loc["be",:]) , color = colors[iqp] )
+			ax.fill_between( qp.time , plink(qp.loc["ql",:]) , plink(qp.loc["qu",:]) , color = colors[iqp] , alpha = 0.5 )
+		ax.set_yticks(plink(yticks))
+		ax.set_yticklabels(yticklabelsL)
+		ax.set_ylabel("Probability")
+		ax.set_ylim(plink([0,1]))
 
-		fig_dr.update_yaxes(title_text="Return period (years)")
-		#fig_dr.update_layout(title="Return period of "+str(input.year())+" years at "+str(round(cons_calc()[2],2))+"°N / "+str(round(cons_calc()[3],2))+" °E")
+		axR = fig.add_subplot( nrow , ncol , 1 , sharex = ax , frameon = False )
+		axR.yaxis.tick_right()
+		axR.set_yticks(plink(yticks))
+		axR.set_yticklabels(yticklabelsR)
+		axR.yaxis.set_label_position( "right" )
+		axR.set_ylabel( "Return period" , rotation = 270 )
+		ax.set_ylim(plink([0,1]))
+		ax.set_title("Return period of a "+str(input.rl_val())+"°C-event at ["+str(rl_calc()[2])+"°N ; "+str(rl_calc()[3])+" °E]")
+		label = ["Factual", "Counterfactual"]
+		legend = [mplpatch.Patch(facecolor = c , edgecolor = c , label = l , alpha = 0.5 ) for c,l in zip(["red","blue"],label)]
+		ax.legend( handles = legend , loc = "upper left" )
 
-		return fig_dr
+		plt.tight_layout()
 
+		#pdf.savefig( fig )
+		#plt.close(fig)
+		#pdf.close()
+
+		return fig
+
+	@render.plot
+	def plot_param_rl():
+
+		climMM = rl_calc()[4]
+		climCXCB = rl_calc()[5]
+
+		#pdf = mpdf.PdfPages( "law_coef_lat"+str(round(rl_calc()[2],2))+"_lon"+str(round(rl_calc()[3],2))+".pdf" )
+
+		ci=0.05
+		qcoefc = climCXCB.law_coef[:,1:,:].quantile( [ci/2,1-ci/2,0.5] , dim = "sample_MCMC" ).assign_coords( quantile = ["ql","qu","BE"] )
+		qcoef  = climMM.law_coef[:,1:,:].quantile( [ci/2,1-ci/2,0.5] , dim = "sample" ).assign_coords( quantile = ["ql","qu","BE"] )
+
+		qcoefc.loc[["ql","qu"],:,:] = qcoefc.loc[["ql","qu"],:,:] - qcoefc.loc["BE",:,:]
+		qcoef = qcoef - qcoefc.loc["BE",:,:]
+
+		## mpl parameter
+		ymin = min( (climCXCB.law_coef - qcoefc.loc["BE",:,:]).min() , (climMM.law_coef - qcoefc.loc["BE",:,:]).min() )
+		ymax = max( (climCXCB.law_coef - qcoefc.loc["BE",:,:]).max() , (climMM.law_coef - qcoefc.loc["BE",:,:]).max() )
+		delta = 0.1 * (ymax-ymin)
+		ylim = (ymin-delta,ymax+delta)
+
+		label = ["Prior distribution", "Posterior"]
+		legend = [mplpatch.Patch(facecolor = c , edgecolor = c , label = l , alpha = 0.5 ) for c,l in zip(["pink","red"],label)]
+		#	legend.append( mplpatch.Patch(facecolor = "red"  , edgecolor = "red"  , label = "clim"       , alpha = 0.5 ) )
+		#	legend.append( mplpatch.Patch(facecolor = "blue" , edgecolor = "blue" , label = "clim_const" , alpha = 0.5 ) )
+
+
+		kwargs = { "positions" : range(climCXCB.n_coef) , "showmeans" : False , "showextrema" : False , "showmedians" : False }
+
+
+		mm     = 1. / 25.4
+		ratio  = 16 / 11
+		nrow   = 1
+		ncol   = 1
+		width  = 180*mm
+		height = width / ncol / ratio * nrow
+
+		fig = plt.figure( figsize = (width,height) )
+		ax  = fig.add_subplot(1,1,1)
+
+		## violin plot
+		vplotc = ax.violinplot( (climCXCB.law_coef - qcoefc.loc["BE",:,:])[:,1:,:].loc[:,:,"Multi_Synthesis"].values.T , **kwargs )
+		vplot  = ax.violinplot( (climMM.law_coef - qcoefc.loc["BE",:,:])[:,1:,:].loc[:,:,"Multi_Synthesis"].values.T , **kwargs )
+
+		## Change color
+		for pc in vplotc["bodies"]:
+			pc.set_facecolor("red")
+			pc.set_edgecolor("red")
+			pc.set_alpha(0.5)
+
+		for pc in vplot["bodies"]:
+			pc.set_facecolor("pink")
+			pc.set_edgecolor("pink")
+			pc.set_alpha(0.4)
+
+		# add quantiles
+		for i in range(climCXCB.n_coef):
+			for q in ["ql","qu"]:
+				ax.hlines( qcoefc[:,i,:].loc[q,"Multi_Synthesis"] , i - 0.3 , i + 0.3 , color = "red" )
+			for q in ["ql","qu","BE"]:
+				ax.hlines( qcoef[:,i,:].loc[q,"Multi_Synthesis"] , i - 0.3 , i + 0.3 , color = "pink" )
+
+		ax.hlines( 0 , -0.5 , climCXCB.n_coef-0.5 , color = "black" )
+		for i in range(climCXCB.n_coef-1):
+			ax.vlines( i + 0.5 , ylim[0] , ylim[1] , color = "grey" )
+
+		## some params
+		ax.set_xlim((-0.5,climCXCB.n_coef-0.5))
+		ax.set_xticks(range(climCXCB.n_coef))
+		xticks = [ "{}".format(p) + "{}".format( "-" if np.sign(q) > 0 else "+" ) + r"${}$".format(float(np.sign(q)) * round(float(q),2)) for p,q in zip(climCXCB.ns_law.get_params_names(True),qcoefc.loc["BE",:,"Multi_Synthesis"]) ]
+		ax.set_xticklabels( xticks )#, fontsize = 20 )
+		#for item in ax.get_yticklabels():
+	#		item.set_fontsize(20)
+		ax.set_ylim(ylim)
+
+		ax.set_title( "GEV parameters "  )
+		ax.legend( handles = legend  )
+
+		fig.set_tight_layout(True)
+
+		#pdf.savefig( fig )
+		#plt.close(fig)
+		#pdf.close()
+
+		return fig
 
 app = App(app_ui, server)
